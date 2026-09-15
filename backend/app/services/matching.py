@@ -102,7 +102,7 @@ class MovieMatcher:
             if tmdb_year and radarr_year and tmdb_year == radarr_year:
                 year_match_boost = 15
 
-            score = (title_similarity * 0.8) + year_match_boost
+            score = min(100, (title_similarity * 0.8) + year_match_boost)
 
         return score
 
@@ -136,7 +136,7 @@ class MovieMatcher:
             if tmdb_year and fs_year and tmdb_year == fs_year:
                 year_match_boost = 15
 
-            score = (title_similarity * 0.8) + year_match_boost
+            score = min(100, (title_similarity * 0.8) + year_match_boost)
 
         return score
 
