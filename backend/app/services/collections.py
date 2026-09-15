@@ -96,6 +96,7 @@ class CollectionService:
             return False
 
         logger.info(f"Deleting collection: {collection.name}")
+        name = collection.name
         db.delete(collection)
         db.commit()
 
@@ -103,7 +104,7 @@ class CollectionService:
             db,
             action="COLLECTION_REMOVED",
             collection_id=collection_id,
-            details={"name": collection.name},
+            details={"name": name},
             result="success",
         )
 
@@ -180,6 +181,63 @@ class CollectionService:
 
                 # Determine movie state
                 await self._analyze_movie_state(db, movie, radarr_movies, fs_movies, excluded_tmdb_ids)
+                state = db.query(MovieState).filter(MovieState.movie_id == movie.id).first()
+
+                # Automatic acquisition is opt-in and only applies to genuinely
+                # missing movies. Existing filesystem files and exclusions are
+                # never sent to Radarr.
+                if (
+                    state
+                    and state.status == "missing"
+                    and (collection.auto_add_missing or self.settings.auto_add_missing)
+                ):
+                    try:
+                        added = await self.radarr.add_movie(
+                            {
+                                "tmdbId": movie.tmdb_movie_id,
+                                "title": movie.title,
+                                "year": movie.year,
+                                "qualityProfileId": (
+                                    collection.quality_profile_id
+                                    or self.settings.radarr_quality_profile_id
+                                ),
+                                "rootFolderPath": (
+                                    collection.root_folder_path
+                                    or self.settings.radarr_root_folder
+                                ),
+                                "monitored": True,
+                                "addOptions": {"searchForMovie": True},
+                            }
+                        )
+                        if added.get("error") == "duplicate":
+                            skipped_count += 1
+                        else:
+                            added_count += 1
+                            radarr_movies.append(added)
+                            state.status = "managed"
+                            state.radarr_managed = True
+                            state.radarr_movie_id = added.get("id")
+                            db.commit()
+                        self._audit_log(
+                            db,
+                            action="MOVIE_ADDED_TO_RADARR",
+                            collection_id=collection.id,
+                            tmdb_movie_id=movie.tmdb_movie_id,
+                            radarr_movie_id=added.get("id"),
+                            details={"automatic": True},
+                            result="success",
+                        )
+                    except Exception as exc:
+                        failed_count += 1
+                        self._audit_log(
+                            db,
+                            action="MOVIE_ADDED_TO_RADARR",
+                            collection_id=collection.id,
+                            tmdb_movie_id=movie.tmdb_movie_id,
+                            details={"automatic": True},
+                            result="failed",
+                            error_message=str(exc),
+                        )
 
             sync_run.status = "completed"
             sync_run.completed_at = datetime.utcnow()
@@ -214,24 +272,34 @@ class CollectionService:
     ) -> None:
         """Analyze and set movie state (managed, existing, missing, excluded, needs_review)."""
         # Check if excluded
+        radarr_movie = None
+        fs_movie = None
         if movie.tmdb_movie_id in excluded_tmdb_ids:
             status = "excluded"
             confidence = 100
         else:
             # Try to match to Radarr
-            radarr_match = self.matcher.match_tmdb_to_radarr(movie.model_dump(), radarr_movies)
+            movie_data = {
+                "id": movie.tmdb_movie_id,
+                "title": movie.title,
+                "release_date": movie.release_date,
+                "imdb_id": movie.imdb_id,
+            }
+            radarr_match = self.matcher.match_tmdb_to_radarr(movie_data, radarr_movies)
             if radarr_match:
                 radarr_movie, confidence = radarr_match
                 status = "managed"
             else:
                 # Try to match to filesystem
-                fs_match = self.matcher.match_tmdb_to_filesystem(movie.model_dump(), fs_movies)
+                fs_match = self.matcher.match_tmdb_to_filesystem(movie_data, fs_movies)
                 if fs_match:
                     fs_movie, confidence = fs_match
                     status = "existing"
                 else:
                     status = "missing"
                     confidence = 0
+                    radarr_movie = None
+                    fs_movie = None
 
         # Create or update movie state
         state = db.query(MovieState).filter(MovieState.movie_id == movie.id).first()
@@ -241,6 +309,10 @@ class CollectionService:
 
         state.status = status
         state.match_confidence = confidence
+        state.radarr_managed = bool(radarr_movie)
+        state.radarr_movie_id = radarr_movie.get("id") if radarr_movie else None
+        state.filesystem_exists = bool(fs_movie)
+        state.filesystem_path = fs_movie.get("path") if fs_movie else None
         state.last_checked_at = datetime.utcnow()
         db.commit()
 
